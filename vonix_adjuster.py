@@ -1,8 +1,21 @@
+
+try:
+    import requests
+except Exception as e:
+    print('>>> Biblioteca requests não encontrada instalar utilizando => pip install requests')
+    exit(1)
+
+try:
+    from bs4 import BeautifulSoup
+except Exception as e:
+    print('>>> Biblioteca BeautifulSoup não encontrada instalar utilizando => pip install bs4')
+    exit(1)
+
+import argparse
 import datetime
-import requests
 import time
 import re
-from bs4 import BeautifulSoup
+import sys
 
 def monta_req_files(vonixHtml, fila, troncos_qtd, period_begin, period_end):
     return [
@@ -72,43 +85,90 @@ def monta_req_files(vonixHtml, fila, troncos_qtd, period_begin, period_end):
         ('x', (None, '21')),
         ('y', (None, '12'))]
 
-#Trocar para o endereço IP do servidor
-url_login   = 'http://0.0.0.0'
-url_adm     = 'http://0.0.0.0'
-url_index   = 'http://0.0.0.0'
-filas       = {'id':[{'fila':'XXXX','period':['X','XX']},{'fila':'XXXX','period':['XX','XX']}]}
-WELCOME ='''
+def check_ip(ip):
+    regex = re.compile('^((10)|(172)|(192)){1}\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])$')
+    if not regex.match(ip):
+        raise argparse.ArgumentTypeError('O IP {} é inválido!'.format(ip))
+    return ip
+
+BANNER ='''
       _ _       _ _                       _  _           _            _
    __| (_) __ _| | | ___ _ __    __ _  __| |(_)_   _ ___| |_ ___ _ __| |
   / _` | |/ _` | | |/ _ \ '__|  / _` |/ _` || | | | / __| __/ _ \ '__| |
  | (_| | | (_| | | |  __/ |    | (_| | (_| || | |_| \__ \ ||  __/ |  |_|
   \__,_|_|\__,_|_|_|\___|_|     \__,_|\__,_|/ |\__,_|___/\__\___|_|  (_)
                                           |__/                          '''
+
+#Checar os argumentos
+print(BANNER)
+parser = argparse.ArgumentParser(prog='dialler_adjuster')
+parser.add_argument('--ip', help='Endereço IP do discador.', required=True, type=check_ip)
+parser.add_argument('--username', help='Nome do usuário Adm. do discador.', required=True)
+parser.add_argument('--password', help='Senha do usuário Adm. do discador.', required=True)
+parser.add_argument('--queues', help='Nome do arquivo parametros das filas discador.', required=True, type=argparse.FileType('r'))
+parser.add_argument('--trunks_add', help='Quantidade de troncos a aumentar', default=3, type=int)
+parser.add_argument('--trunks_max', help='Quantidade máxima de troncos do discador.', default=60, type=int)
+
+args = parser.parse_args()
+
+#Dados do discador
+url_login   = 'http://{}/login/signin'.format(args.ip)
+url_adm     = 'http://{}/admin/queue_save'.format(args.ip)
+url_index   = 'http://{}'.format(args.ip)
+url_sip     = 'http://{}/admin/extension_list'.format(args.ip)
+filas       = {'id':[]}
+
+#Le o arquivo Layout NOME_DA_FILA;HORA_INICIAL;HORA_FINAL
+with args.queues as queues:
+    for lines in queues:
+        filas['id'].append({'fila':'{}'.format(lines.split(';')[0]), 'period':['{}'.format(lines.split(';')[1]),'{}'.format(lines.split(';')[2].rstrip('\n\r'))]})
+
 while(True):
     with requests.Session() as s:
         #Loop nas filas
         for fila in filas['id']:
+            #Faz o login na página inicial
+            try:
+                r = s.post(url_login, data={'authenticity_token': BeautifulSoup(s.get(url_login).text, 'html.parser').input['value'],'return_to':'','username':'{}'.format(args.username),'password':'{}'.format(args.password),'commit':'Entrar'}, cookies={'queue':fila['fila']}, timeout=20)
+            except Exception as e:
+                print('***ERRO REQUISIÇÃO POST!\n{}'.format(e))
+                continue
+
+            #Faz a requisição GET para capturar os Status das operadoras SIP
+            try:
+                vonixHtml = BeautifulSoup(s.get(url_sip, timeout=20).text, 'html.parser').findAll(id=re.compile('^(extension_)[a-zA-Z]{1,}$'))
+                print('\tRAMAL\tIP\t\tPORTA\t\tLATENCIA\t\tSTATUS')
+                for sip in vonixHtml:
+                    for op in sip.get_text().lstrip('\n').split('\n'):
+                        if op in ('-','\n'):
+                            continue
+                        print('{:>9}\t'.format(op), end='')
+                    print()
+                time.sleep(3)
+            except Exception as e:
+                print('***ERRO REQUISIÇÃO POST!\n{}'.format(e))
+
             #Caso fila estiver fora de horário pula
             if datetime.datetime.time(datetime.datetime.now()).hour < int(fila['period'][0]) or datetime.datetime.time(datetime.datetime.now()).hour > int(fila['period'][1]):
                 print('\n***ATENÇÃO FILA {} FORA DE HORÁRIO => {}:{}'.format(fila['fila'], fila['period'][0], fila['period'][1]))
                 continue
 
-            #Faz o login na página inicial
-            try:
-                r = s.post(url_login, data={'authenticity_token': BeautifulSoup(s.get(url_login).text, 'html.parser').input['value'],'return_to':'','username':'XXXX','password':'XXXX','commit':'Entrar'}, cookies={'queue':fila['fila']}, timeout=20)
-            except Exception as e:
-                print('***ERRO REQUISIÇÃO POST!\n{}'.format(e))
+            vonixHtml   = BeautifulSoup(r.text, 'html.parser')
+
+            #Caso fila esteja sem contatos gera um alerta e zera os troncos
+            if vonixHtml.find(id='{}_stat_status'.format(fila['fila'])).get_text().upper() == 'SEM CONTATOS':
+                r = s.post(url_adm, files=monta_req_files(vonixHtml, fila['fila'], 0, fila['period'][0], fila['period'][1]), timeout=20)
+                print('\n***ATENÇÃO FILA {} SEM CONTATOS!\n***DIMINUI QUANTIDADE DE TRONCOS PARA => 0!'.format(fila['fila']))
                 continue
 
-            vonixHtml   = BeautifulSoup(r.text, 'html.parser')
             abandonadas = int(vonixHtml.find(id='auto_abandoned').get_text())
             trunks_max  = int(vonixHtml.find(id='{}_stat_trunks'.format(fila['fila'])).get_text().split('/')[1])
             trunks_min  = int(vonixHtml.find(id='{}_stat_trunks'.format(fila['fila'])).get_text().split('/')[0])
 
             #Caso diferença de Troncos Máximo com a Mínima for maior que 9 setar quantidade mínima
             if (trunks_max - trunks_min) > 9:
-                r = s.post(url_adm, files=monta_req_files(vonixHtml, fila['fila'], 2 if trunks_min < 0 else trunks_min, fila['period'][0], fila['period'][1]), timeout=20)
-                print('***DIMINUI QUANTIDADE DE TRONCOS DE => {} PARA => {}!\n'.format(trunks_max, 2 if trunks_min < 0 else trunks_min))
+                r = s.post(url_adm, files=monta_req_files(vonixHtml, fila['fila'], 2 if trunks_min < 0 else trunks_min + 2, fila['period'][0], fila['period'][1]), timeout=20)
+                print('***DIMINUI QUANTIDADE DE TRONCOS DE => {} PARA => {}!\n'.format(trunks_max, 2 if trunks_min < 0 else trunks_min + 2))
                 continue
 
             fila_espera = int(vonixHtml.find(id='auto_waiting').get_text())
@@ -119,7 +179,7 @@ while(True):
                 time.sleep(5)
                 continue
 
-            print(WELCOME)
+            print(BANNER)
             print('***STATUS***\n***FILA ATUAL => {}\n***CHAMADAS ABANDONADAS => {} TRONCOS => {}!\n'.format(fila['fila'], abandonadas, trunks_max))
             qtd_troncos = 0
             regex_idle  = re.compile('^'+fila['fila']+'_[0-9]{1,4}_idle_time$')
@@ -155,18 +215,24 @@ while(True):
                     print('***DIMINUI QUANTIDADE DE TRONCOS DE => {} PARA => {}!\n'.format(trunks_max, 2 if trunks_min < 0 else trunks_min))
                     time.sleep(3)
                     break
-                #Setar para a quantidade máxima de Troncos disponível
-                if trunks_max >= 60:
+
+                if trunks_max >= args.trunks_max:
                     print('>>>QUANTIDADE MÁXIMA DE TRONCOS ATINGIDA => {}!\n'.format(trunks_max))
                     time.sleep(3)
                     continue
-                qtd_troncos+=1
 
-            if qtd_troncos > 0 and trunks_max < 60:
+                if duration <= 60:
+                    qtd_troncos+= args.trunks_add
+                else:
+                    qtd_troncos+= (duration // 60) * args.trunks_add
+
+            if qtd_troncos > 0 and trunks_max < args.trunks_max:
                 try:
                     r = s.post(url_adm, files=monta_req_files(vonixHtml, fila['fila'], trunks_max + qtd_troncos, fila['period'][0], fila['period'][1]), timeout=20)
                     print('***AUMENTOU QUANTIDADE DE TRONCOS DE => {} PARA => {}!\n'.format(trunks_max, trunks_max + qtd_troncos))
-                    time.sleep(qtd_troncos * 5)
+                    print('>>>TEMPO ESPERA => {}s. ÍNICIO => {}'.format(qtd_troncos * 2, time.ctime()))
+                    time.sleep(qtd_troncos * 2)
+                    print('>>>FIM TEMPO ESPERA => {}'.format(time.ctime()))
                     break
                 except Exception as e:
                     print('***ERRO REQUISIÇÃO POST!\n{}'.format(e))
