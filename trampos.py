@@ -216,7 +216,7 @@ async def pag(auto):
                 else:
                     break
 
-            data    = {'cheia':'1','user':usuario,'password':senha}
+            data    = {''}
             try:
                 r = s.post(url[1], headers=HEADER, data=data, timeout=10)
             except Exception as e:
